@@ -39,28 +39,46 @@ _MS = {"1m": 60_000, "5m": 300_000, "15m": 900_000, "1h": 3_600_000,
 # --------------------------------------------------------------------------- #
 # data sources
 # --------------------------------------------------------------------------- #
+def _http_get_json(url: str):
+    """GET a URL and parse JSON, preferring `requests` (uses certifi, so it
+    avoids the classic macOS 'SSL: CERTIFICATE_VERIFY_FAILED' with plain
+    urllib) and falling back to the stdlib if requests isn't installed.
+    """
+    try:
+        import requests  # type: ignore
+
+        resp = requests.get(url, timeout=30)
+        resp.raise_for_status()
+        return resp.json()
+    except ImportError:
+        import ssl
+
+        ctx = ssl.create_default_context()
+        try:  # use certifi's CA bundle if available — most reliable on macOS
+            import certifi  # type: ignore
+
+            ctx.load_verify_locations(certifi.where())
+        except ImportError:
+            pass
+        with urllib.request.urlopen(url, timeout=30, context=ctx) as resp:  # noqa: S310
+            return json.loads(resp.read().decode())
+
+
 def fetch_binance_klines(symbol: str, interval: str, limit: int = 1000) -> pd.DataFrame:
     """Fetch up to `limit` klines from Binance's public REST endpoint.
 
-    Tries ccxt first (handles pagination/rate limits); falls back to a plain
-    stdlib HTTP request so the script works without ccxt installed.
+    No API key needed — klines are free and public. Uses a plain HTTPS GET
+    (via `requests`/`urllib`), so it does NOT require ccxt. `limit` is capped at
+    1000 by the endpoint; for longer history, use CSVs from data.binance.vision.
     """
-    try:
-        import ccxt  # type: ignore
-
-        ex = ccxt.binance({"enableRateLimit": True})
-        market = symbol if "/" in symbol else f"{symbol[:-4]}/{symbol[-4:]}"
-        ohlcv = ex.fetch_ohlcv(market, timeframe=interval, limit=limit)
-        df = pd.DataFrame(ohlcv, columns=["time", "open", "high", "low", "close", "volume"])
-    except Exception as exc:  # noqa: BLE001 — fall back to raw REST on any ccxt issue
-        print(f"[info] ccxt unavailable or failed ({exc}); using raw REST.", file=sys.stderr)
-        url = f"{BINANCE_KLINES_URL}?symbol={symbol}&interval={interval}&limit={min(limit, 1000)}"
-        with urllib.request.urlopen(url, timeout=30) as resp:  # noqa: S310 — public endpoint
-            raw = json.loads(resp.read().decode())
-        df = pd.DataFrame(raw, columns=[
-            "time", "open", "high", "low", "close", "volume",
-            "close_time", "qav", "trades", "tbb", "tbq", "ignore",
-        ])
+    url = f"{BINANCE_KLINES_URL}?symbol={symbol}&interval={interval}&limit={min(limit, 1000)}"
+    raw = _http_get_json(url)
+    if isinstance(raw, dict) and raw.get("code"):  # Binance error payload
+        raise RuntimeError(f"Binance API error for {symbol}: {raw}")
+    df = pd.DataFrame(raw, columns=[
+        "time", "open", "high", "low", "close", "volume",
+        "close_time", "qav", "trades", "tbb", "tbq", "ignore",
+    ])
     df = df[["time", "open", "high", "low", "close", "volume"]].astype(
         {"open": float, "high": float, "low": float, "close": float, "volume": float}
     )
