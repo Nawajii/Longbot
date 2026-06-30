@@ -86,15 +86,77 @@ def fetch_binance_klines(symbol: str, interval: str, limit: int = 1000) -> pd.Da
     return df.set_index("time").sort_index()
 
 
+def fetch_binance_klines_range(
+    symbol: str, interval: str, start: str, end: str | None = None
+) -> pd.DataFrame:
+    """Page Binance for ALL klines between `start` and `end` (dates, e.g.
+    "2020-01-01"). The endpoint returns 1000 bars max per call, so this loops
+    forward until it reaches the end, assembling years of history. Free, no key.
+    """
+    import time as _time
+
+    start_ms = int(pd.Timestamp(start, tz="UTC").timestamp() * 1000)
+    end_ms = int((pd.Timestamp(end, tz="UTC") if end else pd.Timestamp.utcnow()).timestamp() * 1000)
+    step = _MS[interval]
+    frames: list[pd.DataFrame] = []
+    cursor = start_ms
+    calls = 0
+    while cursor < end_ms:
+        url = (f"{BINANCE_KLINES_URL}?symbol={symbol}&interval={interval}"
+               f"&startTime={cursor}&endTime={end_ms}&limit=1000")
+        raw = _http_get_json(url)
+        if isinstance(raw, dict) and raw.get("code"):
+            raise RuntimeError(f"Binance API error for {symbol}: {raw}")
+        if not raw:
+            break
+        frames.append(pd.DataFrame(raw, columns=[
+            "time", "open", "high", "low", "close", "volume",
+            "close_time", "qav", "trades", "tbb", "tbq", "ignore"]))
+        last_open = raw[-1][0]
+        cursor = last_open + step          # advance past the last bar we got
+        calls += 1
+        if calls % 10 == 0:
+            print(f"[info] {symbol} {interval}: fetched ~{calls * 1000} bars...", file=sys.stderr)
+        if len(raw) < 1000:                # reached the most recent data
+            break
+        _time.sleep(0.25)                  # be polite to the public endpoint
+    if not frames:
+        raise RuntimeError(f"no data returned for {symbol} {interval} from {start}")
+    df = pd.concat(frames, ignore_index=True)
+    df = df[["time", "open", "high", "low", "close", "volume"]].astype(
+        {"open": float, "high": float, "low": float, "close": float, "volume": float})
+    df["time"] = pd.to_datetime(df["time"], unit="ms")
+    return df.drop_duplicates("time").set_index("time").sort_index()
+
+
 def load_csv(path: str) -> pd.DataFrame:
-    """Load OHLCV from a CSV with columns time,open,high,low,close,volume."""
-    df = pd.read_csv(path)
-    df.columns = [c.strip().lower() for c in df.columns]
-    if "time" not in df.columns:
-        df = df.rename(columns={df.columns[0]: "time"})
-    # accept ms epoch or ISO strings
-    if np.issubdtype(df["time"].dtype, np.number):
-        df["time"] = pd.to_datetime(df["time"], unit="ms")
+    """Load OHLCV from a CSV. Handles three common shapes:
+
+    1. our --save-csv output (header row, datetime in the first column);
+    2. any CSV with a time/open/high/low/close/volume header;
+    3. Binance's *headerless* monthly dumps from data.binance.vision
+       (12 columns: open_time(ms), open, high, low, close, volume, ...).
+    """
+    with open(path) as f:
+        first_line = f.readline().lower()
+    has_header = "open" in first_line and "close" in first_line
+
+    if has_header:
+        df = pd.read_csv(path)
+        df.columns = [str(c).strip().lower() for c in df.columns]
+        if "time" not in df.columns:
+            df = df.rename(columns={df.columns[0]: "time"})
+    else:
+        # headerless Binance kline dump — first 6 cols are what we need
+        df = pd.read_csv(path, header=None)
+        cols = ["time", "open", "high", "low", "close", "volume"]
+        df = df.iloc[:, : len(cols)]
+        df.columns = cols
+
+    if pd.api.types.is_numeric_dtype(df["time"]):
+        # epoch could be ms or microseconds depending on the dump; detect by magnitude
+        unit = "us" if df["time"].iloc[0] > 1e15 else "ms"
+        df["time"] = pd.to_datetime(df["time"], unit=unit)
     else:
         df["time"] = pd.to_datetime(df["time"])
     return df.set_index("time")[bt.ind.OHLCV_COLUMNS].sort_index()
@@ -127,14 +189,25 @@ def make_synthetic(n: int = 1500, seed: int = 7) -> pd.DataFrame:
 # driver
 # --------------------------------------------------------------------------- #
 def run_one(df: pd.DataFrame, timeframe: str, capital: float,
-            regime_df: pd.DataFrame | None) -> None:
-    params = bt.BacktestParams(starting_capital=capital, timeframe=timeframe)
+            regime_df: pd.DataFrame | None, entry_valid_bars: int = 3) -> None:
+    params = bt.BacktestParams(
+        starting_capital=capital, timeframe=timeframe, entry_valid_bars=entry_valid_bars,
+    )
     result = bt.run_backtest(df, params, regime_df=regime_df)
     # buy-the-peak baseline: same engine, enter on the trap verdict instead
     peak = bt.run_backtest(
         df, params, entry_verdicts=(se.Verdict.PEAK_EXTENDED,), regime_df=regime_df
     )
+    span = f"{df.index[0].date()} -> {df.index[-1].date()}"
+    print(f"[data] {len(df)} bars, {span}")
     print(bt.format_report(result, df, peak_baseline=peak))
+
+
+def _get_data(symbol: str, timeframe: str, args) -> pd.DataFrame:
+    """Resolve a symbol+timeframe to OHLCV using whichever source the flags imply."""
+    if args.start:
+        return fetch_binance_klines_range(symbol, timeframe, args.start, args.end)
+    return fetch_binance_klines(symbol, timeframe, args.limit)
 
 
 def main() -> None:
@@ -142,8 +215,15 @@ def main() -> None:
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--symbol", default="BTCUSDT")
     ap.add_argument("--timeframe", default="1h", choices=list(_MS))
-    ap.add_argument("--limit", type=int, default=1000)
+    ap.add_argument("--limit", type=int, default=1000,
+                    help="bars to fetch (max 1000) when --start is NOT given")
+    ap.add_argument("--start", help="fetch ALL history from this date, e.g. 2020-01-01 "
+                                    "(pages past the 1000-bar cap — use this for a real test)")
+    ap.add_argument("--end", help="end date for --start range (default: now)")
     ap.add_argument("--capital", type=float, default=1000.0)
+    ap.add_argument("--entry-valid-bars", type=int, default=3,
+                    help="how many bars the buy-stop waits before it is a MISS (tunable)")
+    ap.add_argument("--save-csv", help="also save the fetched OHLCV to this CSV for re-use")
     ap.add_argument("--csv", help="load OHLCV from this CSV instead of fetching")
     ap.add_argument("--regime-csv", help="BTC OHLCV CSV to enable the regime gate")
     ap.add_argument("--regime-symbol", help="fetch this symbol as the regime gate (e.g. BTCUSDT)")
@@ -157,27 +237,28 @@ def main() -> None:
     if args.regime_csv:
         regime_df = load_csv(args.regime_csv)
     elif args.regime_symbol:
-        regime_df = fetch_binance_klines(args.regime_symbol, args.timeframe, args.limit)
+        regime_df = _get_data(args.regime_symbol, args.timeframe, args)
 
     if args.synthetic:
-        df = make_synthetic()
-        run_one(df, "1h-synthetic", args.capital, regime_df)
+        run_one(make_synthetic(), "1h-synthetic", args.capital, regime_df, args.entry_valid_bars)
         return
 
     if args.csv:
-        df = load_csv(args.csv)
-        run_one(df, args.timeframe, args.capital, regime_df)
+        run_one(load_csv(args.csv), args.timeframe, args.capital, regime_df, args.entry_valid_bars)
         return
 
     if args.compare_timeframes:
         for tf in args.compare_timeframes:
             print(f"\n########## {args.symbol} @ {tf} ##########")
-            df = fetch_binance_klines(args.symbol, tf, args.limit)
-            run_one(df, tf, args.capital, regime_df)
+            run_one(_get_data(args.symbol, tf, args), tf, args.capital,
+                    regime_df, args.entry_valid_bars)
         return
 
-    df = fetch_binance_klines(args.symbol, args.timeframe, args.limit)
-    run_one(df, args.timeframe, args.capital, regime_df)
+    df = _get_data(args.symbol, args.timeframe, args)
+    if args.save_csv:
+        df.to_csv(args.save_csv)
+        print(f"[info] saved {len(df)} bars to {args.save_csv}")
+    run_one(df, args.timeframe, args.capital, regime_df, args.entry_valid_bars)
 
 
 if __name__ == "__main__":
