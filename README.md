@@ -53,7 +53,19 @@ python run_real_backtest.py --csv data/BTCUSDT_1h.csv --timeframe 1h
 
 # Enable the regime gate (only trade when BTC is risk-on):
 python run_real_backtest.py --symbol ETHUSDT --timeframe 1h --regime-symbol BTCUSDT
+
+# Fetch YEARS of history (pages past the 1000-bar cap) for a real test:
+python run_real_backtest.py --symbol BTCUSDT --timeframe 4h --start 2020-01-01 --regime-symbol BTCUSDT
+
+# Multi-pair x multi-regime sweep (BULL/BEAR/CHOP) with an aggregated summary:
+python run_scenarios.py --timeframe 4h
 ```
+
+`run_scenarios.py` runs the default 20 pairs across three named windows
+(BULL / BEAR / CHOP), skips pairs with insufficient history, prints each
+per-pair report, then an aggregated summary: total trades, overall win rate,
+overall expectancy (R), and a per-scenario breakdown. This is the test that
+separates a real edge from "it was just a bull market".
 
 The report **always** prints its assumptions (fees, slippage, risk %, stop
 distances) and compares your result against **buy-and-hold** and a
