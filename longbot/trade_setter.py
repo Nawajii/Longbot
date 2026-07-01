@@ -36,10 +36,32 @@ class EntryType(str, Enum):
 @dataclass(frozen=True)
 class TradeSetterParams:
     risk_pct: float = 0.01            # fraction of capital risked per trade (1R)
-    stop_atr_mult: float = 2.0        # hard stop = entry - stop_atr_mult * ATR
+    stop_atr_mult: float = 2.0        # default hard stop = entry - stop_atr_mult * ATR
     entry_buffer_atr: float = 0.10    # buy-stop sits this many ATR above the local high
     min_notional: float = 10.0        # Binance spot min order value (USDT); flag if below
     max_capital_fraction: float = 1.0 # never deploy more than this fraction of capital
+    # --- node-anchored stop (location layer) ---
+    use_node_stop: bool = False       # place the stop just beyond the supporting node
+    node_buffer_atr: float = 0.25     # stop sits this many ATR below the support node
+    stop_atr_floor_mult: float = 1.0  # ATR floor: node stop is never TIGHTER than this
+
+
+def compute_stop(entry: float, atr: float, support_price: float | None,
+                 params: TradeSetterParams) -> float:
+    """Where the protective stop goes.
+
+    Default: a pure ATR distance below entry. When ``use_node_stop`` is on and a
+    real support level sits below entry, anchor the stop just beyond that node
+    (economic meaning: if price decisively leaves the equilibrium zone, the
+    thesis is void) — but never tighter than ``stop_atr_floor_mult`` ATR, so a
+    node hugging the entry can't produce an absurdly tight, easily-wicked stop.
+    """
+    if (params.use_node_stop and support_price is not None
+            and math.isfinite(support_price) and support_price < entry):
+        node_stop = support_price - params.node_buffer_atr * atr
+        floor_stop = entry - params.stop_atr_floor_mult * atr
+        return min(node_stop, floor_stop)   # lower price = wider stop = respects the ATR floor
+    return entry - params.stop_atr_mult * atr
 
 
 @dataclass(frozen=True)
@@ -98,6 +120,7 @@ def build_ticket(
     ema_fast: float,
     atr: float,
     capital: float,
+    support_price: float | None = None,
     entry_type: EntryType = EntryType.BUY_STOP,
     params: TradeSetterParams = TradeSetterParams(),
     filters: SymbolFilters | None = None,
@@ -124,8 +147,8 @@ def build_ticket(
         entry = _round_to_tick(dip_limit, filters.price_tick)
         alt = _round_to_tick(buy_stop, filters.price_tick, up=True)
 
-    # ---- hard stop (measured from the ACTUAL entry) ----
-    stop = _round_to_tick(entry - params.stop_atr_mult * atr, filters.price_tick)
+    # ---- hard stop (measured from the ACTUAL entry; node-anchored if enabled) ----
+    stop = _round_to_tick(compute_stop(entry, atr, support_price, params), filters.price_tick)
     risk_per_unit = entry - stop
     if risk_per_unit <= 0:
         return _infeasible(symbol, entry_type, ["stop is at/above entry — geometry invalid"])
@@ -209,12 +232,17 @@ def from_feature_row(
     filters: SymbolFilters | None = None,
 ) -> OrderTicket:
     """Convenience: build a ticket from a row of scoring-engine features."""
+    support = None
+    if params.use_node_stop and "vp_support_price" in row.index:
+        val = row["vp_support_price"]
+        support = float(val) if pd.notna(val) else None
     return build_ticket(
         symbol,
         local_high=float(row["local_high"]),
         ema_fast=float(row["ema_fast"]),
         atr=float(row["atr"]),
         capital=capital,
+        support_price=support,
         entry_type=entry_type,
         params=params,
         filters=filters,

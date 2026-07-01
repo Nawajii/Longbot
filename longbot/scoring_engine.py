@@ -33,6 +33,7 @@ import numpy as np
 import pandas as pd
 
 from . import indicators as ind
+from . import volume_profile as vp
 
 
 # --------------------------------------------------------------------------- #
@@ -45,6 +46,7 @@ class Verdict(str, Enum):
     PEAK_EXTENDED = "PEAK_EXTENDED"              # strong trend but exhausted/stretched — skip
     NO_UPTREND = "NO_UPTREND"                    # trend not confirmed — skip
     DEEP_PULLBACK_RISK = "DEEP_PULLBACK_RISK"    # pullback too deep / oversold — possible trend break, skip
+    PULLBACK_NO_SUPPORT = "PULLBACK_NO_SUPPORT"  # clean pullback but in a low-volume VOID — skip (location gate)
     NEUTRAL_WAIT = "NEUTRAL_WAIT"                # in an uptrend but no clean setup yet — wait
     NO_DATA = "NO_DATA"                          # not enough history to judge
 
@@ -105,6 +107,13 @@ class ScoringParams:
     # --- aroon (trend youth, used in ranking) ---
     aroon_period: int = 25
 
+    # --- location layer (Volume Profile) — TOGGLE for the blind-vs-located A/B ---
+    use_location: bool = False             # False = old blind engine; True = location-gated
+    vp_lookback: int = vp.VP_LOOKBACK
+    vp_bins: int = vp.N_BINS
+    vp_value_area_pct: float = vp.VALUE_AREA_PCT
+    vp_near_node_pct: float = vp.NEAR_NODE_PCT
+
 
 DEFAULT_PARAMS = ScoringParams()
 
@@ -132,7 +141,11 @@ class SetupScore:
 # --------------------------------------------------------------------------- #
 # Feature computation (vectorised once over the whole frame; no lookahead)
 # --------------------------------------------------------------------------- #
-def compute_features(df: pd.DataFrame, params: ScoringParams = DEFAULT_PARAMS) -> pd.DataFrame:
+def compute_features(
+    df: pd.DataFrame,
+    params: ScoringParams = DEFAULT_PARAMS,
+    location_features: pd.DataFrame | None = None,
+) -> pd.DataFrame:
     """Compute every indicator the engine needs, aligned to ``df``'s index.
 
     Computed once over the full series for backtest efficiency. Each indicator
@@ -184,6 +197,15 @@ def compute_features(df: pd.DataFrame, params: ScoringParams = DEFAULT_PARAMS) -
     # "stretch" and "distance to fast EMA" measured in ATR units (volatility-normalised)
     feat["stretch_atr"] = (close - feat["ema_fast"]) / feat["atr"]
     feat["dist_fast_atr"] = (close - feat["ema_fast"]).abs() / feat["atr"]
+
+    # location layer (Volume Profile) — only when enabled, to keep the blind
+    # engine identical to before and the A/B comparison clean.
+    if params.use_location:
+        loc = location_features if location_features is not None else vp.compute_location_features(
+            df, lookback=params.vp_lookback, n_bins=params.vp_bins,
+            value_area_pct=params.vp_value_area_pct, near_pct=params.vp_near_node_pct,
+        )
+        feat = feat.join(loc)
 
     return feat
 
@@ -338,7 +360,19 @@ def classify_setup(row: pd.Series, params: ScoringParams = DEFAULT_PARAMS) -> Se
         # in an uptrend but momentum collapsed — treat as possible trend break
         verdict = Verdict.DEEP_PULLBACK_RISK
     elif pullback_ok and volume_ok and momentum_state in (MomentumState.COOLED, MomentumState.NEUTRAL):
-        verdict = Verdict.PULLBACK_IN_UPTREND
+        # A clean pullback in an uptrend. If the location layer is on, it is only
+        # actionable when the pullback is INTO real support (at an HVN / value-area
+        # low); a pullback hanging in a low-volume void has nothing beneath it.
+        if params.use_location and not bool(row.get("vp_at_node", False)):
+            verdict = Verdict.PULLBACK_NO_SUPPORT
+            reasons.append("location: pullback in a low-volume VOID (no support beneath) — skip")
+        else:
+            verdict = Verdict.PULLBACK_IN_UPTREND
+            if params.use_location:
+                reasons.append(
+                    f"location: pullback INTO support "
+                    f"(dist to HVN {row.get('vp_dist_hvn_pct', float('nan'))*100:.2f}%)"
+                )
     else:
         verdict = Verdict.NEUTRAL_WAIT
 

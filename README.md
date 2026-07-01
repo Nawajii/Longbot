@@ -24,6 +24,7 @@ non-negotiable constraint).
 | `longbot/pair_picker.py` | The 5-stage funnel (regime → liquidity → trend → pullback → rank). | Scans many coins, throws out everything unsafe, ranks what's left, picks one. |
 | `backtest.py` | Bar-by-bar simulator with no lookahead, fees, slippage, fill modelling. | The truth machine. Tells you if any of this would have worked. |
 | `run_real_backtest.py` | Fetches Binance klines (or a CSV, or synthetic) and runs the backtest. | The button you press to run the experiment. |
+| `longbot/volume_profile.py` | Rolling volume-at-price: POC, Value Area, HVN/LVN, `location()`. | The **location** gear — is the pullback resting on real support, or hanging in a void? |
 | `longbot/config.py` | Settings + secrets via `.env`. | Where keys and risk limits live (keys never go in git). |
 
 ### The one rule that makes this strategy different
@@ -66,6 +67,31 @@ python run_scenarios.py --timeframe 4h
 per-pair report, then an aggregated summary: total trades, overall win rate,
 overall expectancy (R), and a per-scenario breakdown. This is the test that
 separates a real edge from "it was just a bull market".
+
+### The Volume Profile "location" layer + experiment
+The blind pullback engine knew direction, timing and risk but not **location** —
+it would buy a pullback without checking whether real support sat beneath it.
+`volume_profile.py` adds that gear: a rolling **volume-at-price** histogram whose
+peaks (High-Volume Nodes) are equilibrium/support zones and whose valleys
+(Low-Volume Nodes) are voids. It is inserted as a toggle between the trend and
+momentum layers, and it can re-anchor the stop just beyond the supporting node
+(with an ATR floor so the stop is never absurdly tight).
+
+> **Approximation, stated plainly:** true volume-at-price needs tick data. We
+> only have OHLCV candles, so each candle's volume is spread *evenly* across the
+> price bins its high–low range spans. That is the standard OHLCV approximation
+> and nothing more — it cannot see intrabar structure. The profile at bar `i`
+> uses only bars `≤ i` (there is a unit test proving no lookahead).
+
+```bash
+# The pre-registered location experiment (primary tag test + secondary A/B):
+python run_location_test.py --timeframe 4h
+```
+It prints the hypothesis, then: **(primary)** every blind-engine pullback tagged
+`AT_NODE` vs `IN_VOID` with expectancy/win-rate/count for each — does location
+*discriminate*? — and **(secondary)** the full new gearbox (location gate +
+node stops) head-to-head against the blind engine, aggregate and per scenario.
+Cells with <30 trades are flagged NOT CONCLUSIVE. Fixed VP config, no sweeping.
 
 The report **always** prints its assumptions (fees, slippage, risk %, stop
 distances) and compares your result against **buy-and-hold** and a

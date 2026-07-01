@@ -55,6 +55,10 @@ class BacktestParams:
     entry_valid_bars: int = 3         # buy-stop is cancelled if unfilled after N bars
     min_notional: float = 10.0        # exchange minimum; trades below are skipped
     timeframe: str = "1h"             # label only, for the report
+    # --- node-anchored stop (location layer); off = original ATR stop ---
+    use_node_stop: bool = False
+    node_buffer_atr: float = 0.25
+    stop_atr_floor_mult: float = 1.0
 
 
 # --------------------------------------------------------------------------- #
@@ -73,6 +77,7 @@ class Trade:
     bars_held: int
     exit_reason: str           # "stop" | "trail" | "end_of_data"
     fees_paid: float
+    tag: str = ""              # optional location label at the signal bar ("AT_NODE"/"IN_VOID")
 
 
 @dataclass
@@ -182,15 +187,23 @@ def run_backtest(
     scoring_params: se.ScoringParams = se.DEFAULT_PARAMS,
     entry_verdicts: tuple[se.Verdict, ...] = (se.Verdict.PULLBACK_IN_UPTREND,),
     regime_df: pd.DataFrame | None = None,
+    tag_series: pd.Series | None = None,
+    location_features: pd.DataFrame | None = None,
 ) -> BacktestResult:
     """Simulate the strategy over one pair's OHLCV history.
 
     ``entry_verdicts`` lets the same engine run the *buy-the-peak* baseline by
     passing ``(Verdict.PEAK_EXTENDED,)``. ``regime_df`` (e.g. BTC) optionally
     gates entries to risk-on bars; pass None to disable the regime gate.
+
+    ``tag_series`` is an optional boolean Series aligned to ``df.index``. When a
+    signal places an order at bar ``i``, the resulting trade is tagged
+    ``"AT_NODE"`` if ``tag_series.iloc[i]`` is True else ``"IN_VOID"``. This is
+    how the PRIMARY location test labels existing trades WITHOUT changing any
+    entry or stop — it isolates the location effect.
     """
     ind.validate_ohlcv(df)
-    feat = se.compute_features(df, scoring_params)
+    feat = se.compute_features(df, scoring_params, location_features=location_features)
 
     # Precompute per-bar verdicts once (still no lookahead — each row uses <= i).
     verdicts = [se.classify_setup(feat.iloc[i], scoring_params).verdict for i in range(len(df))]
@@ -207,6 +220,9 @@ def run_backtest(
         stop_atr_mult=params.stop_atr_mult,
         entry_buffer_atr=params.entry_buffer_atr,
         min_notional=params.min_notional,
+        use_node_stop=params.use_node_stop,
+        node_buffer_atr=params.node_buffer_atr,
+        stop_atr_floor_mult=params.stop_atr_floor_mult,
     )
 
     # state
@@ -242,8 +258,9 @@ def run_backtest(
             fill = _buy_fill_price(pending["entry"], bar, params.slippage_pct)
             if fill is not None:
                 res.fills += 1
-                # hard stop measured from the ACTUAL fill (spec: stop from actual entry)
-                stop = fill - params.stop_atr_mult * pending["atr"]
+                # hard stop measured from the ACTUAL fill (spec: stop from actual
+                # entry); node-anchored when the location layer is on.
+                stop = ts.compute_stop(fill, pending["atr"], pending.get("support"), setter_params)
                 qty = pending["qty"]
                 fee = fill * qty * params.fee_pct
                 capital -= fee
@@ -251,6 +268,7 @@ def run_backtest(
                     "entry": fill, "qty": qty, "stop": stop, "stop_initial": stop,
                     "atr": pending["atr"], "highest": bar["high"], "trailing": False,
                     "entry_time": ts_now, "entry_index": i, "fees": fee,
+                    "tag": pending.get("tag", ""),
                 }
                 state, pending = "LONG", None
             elif i >= pending["expiry_index"]:
@@ -271,10 +289,16 @@ def run_backtest(
                     )
                     if ticket.feasible and i + 1 < n:
                         res.orders_placed += 1
+                        support = row.get("vp_support_price")
+                        tag = ""
+                        if tag_series is not None:
+                            tag = "AT_NODE" if bool(tag_series.iloc[i]) else "IN_VOID"
                         pending = {
                             "entry": ticket.entry_price,
                             "qty": ticket.quantity,
                             "atr": float(row["atr"]),
+                            "support": float(support) if pd.notna(support) else None,
+                            "tag": tag,
                             "expiry_index": i + params.entry_valid_bars,
                         }
                         state = "PENDING"
@@ -312,6 +336,7 @@ def _close_position(res, position, raw_exit, exit_time, exit_index, params, capi
         pnl=proceeds, r_multiple=r_mult,
         bars_held=exit_index - position["entry_index"],
         exit_reason=reason, fees_paid=total_fees,
+        tag=position.get("tag", ""),
     ))
     return capital
 
