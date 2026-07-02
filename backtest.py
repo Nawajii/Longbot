@@ -59,6 +59,9 @@ class BacktestParams:
     use_node_stop: bool = False
     node_buffer_atr: float = 0.25
     stop_atr_floor_mult: float = 1.0
+    # --- exit style (the ONLY thing the exit-variant grid changes) ---
+    exit_style: str = "TRAIL"         # "TRAIL" (use trail_atr_mult) | "TIME" (exit after N bars)
+    time_exit_bars: int = 12          # for exit_style == "TIME"
 
 
 # --------------------------------------------------------------------------- #
@@ -75,9 +78,18 @@ class Trade:
     pnl: float                 # net of fees and slippage, in quote currency
     r_multiple: float          # pnl in units of initial risk (1R)
     bars_held: int
-    exit_reason: str           # "stop" | "trail" | "end_of_data"
+    exit_reason: str           # "stop" | "trail" | "time" | "end_of_data"
     fees_paid: float
     tag: str = ""              # optional location label at the signal bar ("AT_NODE"/"IN_VOID")
+    peak_price: float = float("nan")   # highest price seen while in the trade (for giveback)
+
+    @property
+    def giveback_r(self) -> float:
+        """How much of the peak we surrendered by exit, in R (peak -> exit)."""
+        risk = self.entry_price - self.stop_initial
+        if risk <= 0 or math.isnan(self.peak_price):
+            return float("nan")
+        return (self.peak_price - self.exit_price) / risk
 
 
 @dataclass
@@ -238,19 +250,30 @@ def run_backtest(
         # ---------------- manage an open position ----------------
         if state == "LONG":
             assert position is not None
-            # 1) PESSIMISTIC: test stop against the EXISTING stop first.
+            # 1) PESSIMISTIC: test the stop against the EXISTING stop first, so a
+            #    single bar can never both save us and stop us out.
             fill = _sell_fill_price(position["stop"], bar, params.slippage_pct)
             if fill is not None:
                 capital = _close_position(res, position, fill, ts_now, i, params, capital,
                                           reason="trail" if position["trailing"] else "stop")
                 state, position = "FLAT", None
             else:
-                # 2) survived — ratchet the trailing stop UP only.
+                # track the peak (for trailing and for giveback reporting)
                 position["highest"] = max(position["highest"], bar["high"])
-                trail = position["highest"] - params.trail_atr_mult * position["atr"]
-                if trail > position["stop"]:
-                    position["stop"] = trail
-                    position["trailing"] = True
+                if params.exit_style == "TIME":
+                    # 2a) time-based exit: close at market on the open of entry+N.
+                    #     The 2xATR hard stop above still provides disaster cover.
+                    if i - position["entry_index"] >= params.time_exit_bars:
+                        exit_raw = bar["open"] * (1.0 - params.slippage_pct)
+                        capital = _close_position(res, position, exit_raw, ts_now, i, params,
+                                                  capital, reason="time")
+                        state, position = "FLAT", None
+                else:
+                    # 2b) trailing exit: ratchet the stop UP only.
+                    trail = position["highest"] - params.trail_atr_mult * position["atr"]
+                    if trail > position["stop"]:
+                        position["stop"] = trail
+                        position["trailing"] = True
 
         # ---------------- try to fill a pending order ----------------
         elif state == "PENDING":
@@ -337,6 +360,7 @@ def _close_position(res, position, raw_exit, exit_time, exit_index, params, capi
         bars_held=exit_index - position["entry_index"],
         exit_reason=reason, fees_paid=total_fees,
         tag=position.get("tag", ""),
+        peak_price=position.get("highest", float("nan")),
     ))
     return capital
 

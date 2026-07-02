@@ -93,6 +93,21 @@ It prints the hypothesis, then: **(primary)** every blind-engine pullback tagged
 node stops) head-to-head against the blind engine, aggregate and per scenario.
 Cells with <30 trades are flagged NOT CONCLUSIVE. Fixed VP config, no sweeping.
 
+### The exit-variant grid (final engine experiment)
+`run_exit_grid.py` asks whether the *exit* was truncating winners. On identical
+located (AT_NODE) entries and an identical 2×ATR node-anchored initial stop, it
+runs four exits — `TRAIL_2` (trail 3×ATR, control), `TRAIL_4`, `TRAIL_6`, and
+`TIME_12` (exit at market after 12 bars) — over the same 20×3×4h sweep, so any
+difference is attributable to the exit alone (a unit test proves the entries are
+identical). It reports trades / win% / avg win R / avg loss R / expectancy /
+bars held / giveback (peak→exit in R) / worst drawdown, per-scenario expectancy,
+and a **binding** verdict against a success bar fixed in advance (expectancy
+≥ +0.15 R, ≥ 60 trades, not positive-only-in-BULL).
+
+```bash
+python run_exit_grid.py --timeframe 4h
+```
+
 The report **always** prints its assumptions (fees, slippage, risk %, stop
 distances) and compares your result against **buy-and-hold** and a
 **buy-the-peak** baseline. If the strategy can't beat buy-and-hold net of costs,
