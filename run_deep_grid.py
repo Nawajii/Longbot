@@ -44,16 +44,58 @@ BAR_EXPECTANCY = 0.15
 BAR_MIN_TRADES = 200          # deep history should easily clear this
 REGIMES = ("BULL", "BEAR", "CHOP")
 
+# The regime LABEL must be INDEPENDENT of the entry gate, or it is tautological.
+# The entry gate uses EMA200 on the trading timeframe (~33 days on 4h); a trade
+# only fires when BTC is above a *rising* EMA200 — which is the gate's own BULL
+# condition, so labelling with the same measure forces every trade to "BULL".
+# The macro cycle uses a far longer trend (~200 DAYS), so a trade taken during a
+# 2022 bear-market rally (fine gate briefly open) is correctly tagged BEAR.
+MACRO_EMA_BARS = 1200         # ~200 days on 4h — the macro bull/bear trend line
+MACRO_SLOPE_BARS = 180        # ~30 days — slope of that macro trend
 
-def btc_regime_labels(btc_df: pd.DataFrame) -> pd.Series:
-    """Per-bar BTC regime: BULL / BEAR / CHOP (no lookahead — trailing EMA+slope)."""
+
+def btc_regime_labels(btc_df: pd.DataFrame,
+                      ema_bars: int = MACRO_EMA_BARS,
+                      slope_bars: int = MACRO_SLOPE_BARS) -> pd.Series:
+    """Per-bar BTC MACRO regime: BULL / BEAR / CHOP (no lookahead — trailing EMA+slope).
+
+    Deliberately uses a long (~200-day) trend, INDEPENDENT of the strategy's
+    entry gate, so bear-cycle trades are counted as BEAR instead of collapsing
+    into a tautological all-BULL label.
+    """
     close = btc_df["close"]
-    ema = ind.ema(close, 200)
-    slope = ind.slope(ema, 20)
+    ema = ind.ema(close, ema_bars)
+    slope = ind.slope(ema, slope_bars)
     label = pd.Series("CHOP", index=btc_df.index)
     label[(close > ema) & (slope > 0)] = "BULL"
     label[(close < ema) & (slope < 0)] = "BEAR"
     return label
+
+
+def regime_bar_proof(regime_label: pd.Series) -> tuple[str, bool]:
+    """Print regime bar counts + a 2022=bear sanity check. Returns (text, sane)."""
+    total = len(regime_label)
+    counts = {r: int((regime_label == r).sum()) for r in REGIMES}
+    lines = [" REGIME BAR-COUNT PROOF (full BTC series, macro ~200-day trend):"]
+    for r in REGIMES:
+        lines.append(f"   {r:<5}: {counts[r]:>6} bars ({100*counts[r]/total:.1f}%)")
+    idx = regime_label.index
+    def _frac(lo, hi, reg):
+        m = regime_label[(idx >= lo) & (idx < hi)]
+        return float((m == reg).mean()) * 100 if len(m) else float("nan")
+    b22 = _frac("2022-04-01", "2022-12-01", "BEAR")
+    u21 = _frac("2021-01-01", "2021-12-01", "BULL")
+    u23 = _frac("2023-06-01", "2024-06-01", "BULL")
+    lines += [
+        f"   sanity: 2022 Apr-Nov = {b22:.0f}% BEAR (expect predominantly BEAR)",
+        f"           2021        = {u21:.0f}% BULL (expect predominantly BULL)",
+        f"           2023H2-2024 = {u23:.0f}% BULL (expect predominantly BULL)",
+    ]
+    # sane if all three regimes are represented and 2022 reads mostly bear
+    sane = all(counts[r] > total * 0.03 for r in REGIMES) and (b22 >= 50)
+    if not sane:
+        lines.append("   !! REGIME PROOF NOT SANE — do not trust the per-regime verdict below.")
+    return "\n".join(lines), sane
 
 
 def _loc_features_cached(symbol: str, timeframe: str, df: pd.DataFrame,
@@ -87,6 +129,8 @@ def run_deep(pairs, timeframe, start, end, capital, entry_valid_bars,
     print(f"[data] fetching regime {regime_symbol} {timeframe} {start}->now (cached in {cache_dir}/)")
     regime_df = fetch_or_cache(regime_symbol, timeframe, start, end, cache_dir, refresh)
     regime_label = btc_regime_labels(regime_df)
+    proof_text, proof_sane = regime_bar_proof(regime_label)
+    print("\n" + proof_text + "\n")
 
     for pair in pairs:
         try:
@@ -124,25 +168,37 @@ def run_deep(pairs, timeframe, start, end, capital, entry_valid_bars,
 
     return dict(trades=trades, by_regime=by_regime, worst_dd=worst_dd,
                 executed=executed, skipped=skipped, coverage=coverage,
-                bh_returns=bh_returns)
+                bh_returns=bh_returns, proof_text=proof_text, proof_sane=proof_sane)
 
 
 def _verdict(name, R):
+    """Return (status, reason) where status is PASS | FAIL | UNPROVEN.
+
+    The regime-robustness clause requires a CONCLUSIVE (n>=30) non-bull cell that
+    is >= 0. If BEAR and CHOP are both too thin to judge, robustness is UNPROVEN
+    (NOT a free pass) — because the strategy's own gate confines it to bull.
+    """
     m = _metrics(R["trades"][name])
-    per = {r: _metrics(R["by_regime"][name][r])["exp"] for r in REGIMES}
-    bull, bear, chop = per["BULL"], per["BEAR"], per["CHOP"]
+    stats = {r: _metrics(R["by_regime"][name][r]) for r in REGIMES}
     if m["n"] < BAR_MIN_TRADES:
-        return False, f"only {m['n']} trades (< {BAR_MIN_TRADES})"
+        return "FAIL", f"only {m['n']} trades (< {BAR_MIN_TRADES})"
     if not (m["exp"] >= BAR_EXPECTANCY):
-        return False, f"expectancy {m['exp']:+.3f} R (< +{BAR_EXPECTANCY})"
-    not_bull_only = (
-        (not np.isnan(bear) and bear >= 0) or (not np.isnan(chop) and chop >= 0)
-        or (not np.isnan(bull) and bull >= BAR_EXPECTANCY
-            and (np.isnan(bear) or bear > -0.05) and (np.isnan(chop) or chop > -0.05))
-    )
-    if not not_bull_only:
-        return False, "positive-only-in-BULL (fails regime-robustness)"
-    return True, f"expectancy {m['exp']:+.3f} R on {m['n']} trades, robust across regimes"
+        return "FAIL", f"expectancy {m['exp']:+.3f} R (< +{BAR_EXPECTANCY})"
+
+    nonbull = [(r, stats[r]) for r in ("BEAR", "CHOP")]
+    conclusive = [(r, s) for r, s in nonbull if s["n"] >= MIN_CONCLUSIVE]
+    if not conclusive:
+        return "UNPROVEN", (f"BEAR/CHOP samples too thin "
+                            f"(BEAR n={stats['BEAR']['n']}, CHOP n={stats['CHOP']['n']}; "
+                            f"< {MIN_CONCLUSIVE}) — the gate confines trading to bull, so "
+                            f"regime-robustness is UNPROVEN")
+    positive = [r for r, s in conclusive if s["exp"] >= 0]
+    if positive:
+        return "PASS", (f"expectancy {m['exp']:+.3f} R on {m['n']} trades; "
+                        f"holds up in {', '.join(positive)} (>=0, n>=30)")
+    worst = min(conclusive, key=lambda x: x[1]["exp"])
+    return "FAIL", (f"positive-only-in-BULL: {worst[0]} expectancy "
+                    f"{worst[1]['exp']:+.3f} R (n={worst[1]['n']})")
 
 
 def format_deep(R) -> str:
@@ -151,6 +207,8 @@ def format_deep(R) -> str:
          "-" * 96,
          " SUCCESS BAR (all required): expectancy >= +0.15 R  AND  >= 200 trades  AND  not BULL-only.",
          "=" * 96,
+         R.get("proof_text", ""),
+         "-" * 96,
          f" pairs run: {R['executed']}   skipped: {R['skipped']}"]
     short = [(p, d) for (p, d, _n) in R["coverage"] if d.year > 2019]
     if short:
@@ -183,20 +241,29 @@ def format_deep(R) -> str:
     L.append("   * = < 30 trades in cell: NOT CONCLUSIVE")
 
     L += ["-" * 96, " BINDING VERDICT (against the pre-registered bar):"]
-    winners = []
+    winners, unproven = [], []
     for name in VARIANTS:
-        ok, why = _verdict(name, R)
-        L.append(f"   {name}: {'PASS' if ok else 'fail'} — {why}")
-        if ok:
+        status, why = _verdict(name, R)
+        L.append(f"   {name}: {status} — {why}")
+        if status == "PASS":
             winners.append((name, _metrics(R["trades"][name])["exp"]))
+        elif status == "UNPROVEN":
+            unproven.append(name)
     L += ["=" * 96]
-    if winners:
+    if not R.get("proof_sane", True):
+        L.append(" REGIME PROOF NOT SANE — the per-regime split is untrustworthy; verdict WITHHELD.")
+    elif winners:
         best = max(winners, key=lambda x: x[1])
-        L.append(f" SUPPORTED: '{best[0]}' clears the bar (expectancy {best[1]:+.3f} R) on deep history.")
+        L.append(f" SUPPORTED: '{best[0]}' clears the bar (expectancy {best[1]:+.3f} R) AND holds up")
+        L.append(" outside bull markets with a conclusive (n>=30) BEAR/CHOP sample.")
+    elif unproven:
+        L.append(" NOT SUPPORTED: variants clear +0.15 R and >=200 trades, but regime-robustness is")
+        L.append(f" UNPROVEN ({', '.join(unproven)}): the strategy's own gate confines it to bull, so")
+        L.append(" BEAR/CHOP samples are too thin to show the edge survives outside a bull market.")
+        L.append(" A bull-only edge you cannot verify outside bull is not a deployable edge — retired.")
     else:
-        L.append(" NOT SUPPORTED: No exit variant cleared the bar on deep history. Across blind,")
-        L.append(" located, exit-grid and now SLC's 2R target on 2019->now data, the pullback/SLC")
-        L.append(" engine shows no regime-robust edge net of costs. The engine is retired.")
+        L.append(" NOT SUPPORTED: No exit variant cleared the bar. Once BEAR/CHOP trades are counted")
+        L.append(" correctly, the edge is positive only in bull markets. The pullback/SLC engine is retired.")
     L += ["=" * 96]
     return "\n".join(L)
 
