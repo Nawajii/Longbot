@@ -41,23 +41,28 @@ BAR_MIN_TRADES = 60
 # Shared base: identical entries + identical 2xATR node-anchored INITIAL stop.
 _BASE = dict(use_node_stop=True, stop_atr_mult=2.0, stop_atr_floor_mult=2.0)
 
-# The four registered variants — ONLY the exit differs.
+# The registered variants — ONLY the exit differs.
 VARIANTS: dict[str, dict] = {
     "TRAIL_2": {**_BASE, "exit_style": "TRAIL", "trail_atr_mult": 3.0},   # control (current)
     "TRAIL_4": {**_BASE, "exit_style": "TRAIL", "trail_atr_mult": 4.0},
     "TRAIL_6": {**_BASE, "exit_style": "TRAIL", "trail_atr_mult": 6.0},
     "TIME_12": {**_BASE, "exit_style": "TIME", "time_exit_bars": 12},
+    "TARGET_2R": {**_BASE, "exit_style": "TARGET", "target_r": 2.0},      # SLC's fixed 2R take-profit
 }
 
 
 def _metrics(trades) -> dict:
     if not trades:
         return dict(n=0, win=float("nan"), avg_win=float("nan"), avg_loss=float("nan"),
-                    exp=float("nan"), bars=float("nan"), giveback=float("nan"))
+                    exp=float("nan"), bars=float("nan"), giveback=float("nan"),
+                    profit_factor=float("nan"))
     rs = [t.r_multiple for t in trades if not np.isnan(t.r_multiple)]
     wins = [t.r_multiple for t in trades if t.pnl > 0]
     losses = [t.r_multiple for t in trades if t.pnl <= 0]
     gb = [t.giveback_r for t in trades if not np.isnan(t.giveback_r)]
+    gross_win = sum(t.pnl for t in trades if t.pnl > 0)
+    gross_loss = -sum(t.pnl for t in trades if t.pnl < 0)
+    pf = (gross_win / gross_loss) if gross_loss > 0 else float("inf") if gross_win > 0 else float("nan")
     return dict(
         n=len(trades),
         win=len(wins) / len(trades),
@@ -66,6 +71,7 @@ def _metrics(trades) -> dict:
         exp=float(np.mean(rs)) if rs else float("nan"),
         bars=float(np.mean([t.bars_held for t in trades])),
         giveback=float(np.mean(gb)) if gb else float("nan"),
+        profit_factor=pf,
     )
 
 

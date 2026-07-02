@@ -129,6 +129,30 @@ def fetch_binance_klines_range(
     return df.drop_duplicates("time").set_index("time").sort_index()
 
 
+def fetch_or_cache(
+    symbol: str, interval: str, start: str, end: str | None = None,
+    cache_dir: str = "data", refresh: bool = False,
+) -> pd.DataFrame:
+    """Fetch a deep history range, caching to ``cache_dir/{symbol}_{interval}.csv``.
+
+    First run downloads and caches; later runs load the CSV so the experiment is
+    reproducible and does not re-hit the network. Pass ``refresh=True`` to force
+    a re-download. Returns the cached data sliced to [start, end].
+    """
+    import os
+
+    os.makedirs(cache_dir, exist_ok=True)
+    path = os.path.join(cache_dir, f"{symbol}_{interval}.csv")
+    if os.path.exists(path) and not refresh:
+        df = load_csv(path)
+    else:
+        df = fetch_binance_klines_range(symbol, interval, start, end)
+        df.to_csv(path)
+    lo = pd.Timestamp(start)
+    hi = pd.Timestamp(end) if end else df.index.max()
+    return df[(df.index >= lo) & (df.index <= hi)]
+
+
 def load_csv(path: str) -> pd.DataFrame:
     """Load OHLCV from a CSV. Handles three common shapes:
 

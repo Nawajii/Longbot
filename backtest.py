@@ -60,8 +60,9 @@ class BacktestParams:
     node_buffer_atr: float = 0.25
     stop_atr_floor_mult: float = 1.0
     # --- exit style (the ONLY thing the exit-variant grid changes) ---
-    exit_style: str = "TRAIL"         # "TRAIL" (use trail_atr_mult) | "TIME" (exit after N bars)
+    exit_style: str = "TRAIL"         # "TRAIL" | "TIME" | "TARGET"
     time_exit_bars: int = 12          # for exit_style == "TIME"
+    target_r: float = 2.0             # for exit_style == "TARGET": take profit at +target_r R
 
 
 # --------------------------------------------------------------------------- #
@@ -78,7 +79,7 @@ class Trade:
     pnl: float                 # net of fees and slippage, in quote currency
     r_multiple: float          # pnl in units of initial risk (1R)
     bars_held: int
-    exit_reason: str           # "stop" | "trail" | "time" | "end_of_data"
+    exit_reason: str           # "stop" | "trail" | "time" | "target" | "end_of_data"
     fees_paid: float
     tag: str = ""              # optional location label at the signal bar ("AT_NODE"/"IN_VOID")
     peak_price: float = float("nan")   # highest price seen while in the trade (for giveback)
@@ -268,8 +269,18 @@ def run_backtest(
                         capital = _close_position(res, position, exit_raw, ts_now, i, params,
                                                   capital, reason="time")
                         state, position = "FLAT", None
+                elif params.exit_style == "TARGET":
+                    # 2b) fixed take-profit at +target_r R. The STOP was already
+                    #     checked above, so if a bar spans BOTH stop and target we
+                    #     have already exited at the stop — the pessimistic rule:
+                    #     never credit the favorable target fill on a spanning bar.
+                    if bar["high"] >= position["target"]:
+                        exit_raw = position["target"] * (1.0 - params.slippage_pct)
+                        capital = _close_position(res, position, exit_raw, ts_now, i, params,
+                                                  capital, reason="target")
+                        state, position = "FLAT", None
                 else:
-                    # 2b) trailing exit: ratchet the stop UP only.
+                    # 2c) trailing exit: ratchet the stop UP only.
                     trail = position["highest"] - params.trail_atr_mult * position["atr"]
                     if trail > position["stop"]:
                         position["stop"] = trail
@@ -287,11 +298,12 @@ def run_backtest(
                 qty = pending["qty"]
                 fee = fill * qty * params.fee_pct
                 capital -= fee
+                target = fill + params.target_r * (fill - stop)   # for TARGET exit
                 position = {
                     "entry": fill, "qty": qty, "stop": stop, "stop_initial": stop,
                     "atr": pending["atr"], "highest": bar["high"], "trailing": False,
                     "entry_time": ts_now, "entry_index": i, "fees": fee,
-                    "tag": pending.get("tag", ""),
+                    "tag": pending.get("tag", ""), "target": target,
                 }
                 state, pending = "LONG", None
             elif i >= pending["expiry_index"]:
