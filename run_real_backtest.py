@@ -39,11 +39,8 @@ _MS = {"1m": 60_000, "5m": 300_000, "15m": 900_000, "1h": 3_600_000,
 # --------------------------------------------------------------------------- #
 # data sources
 # --------------------------------------------------------------------------- #
-def _http_get_json(url: str):
-    """GET a URL and parse JSON, preferring `requests` (uses certifi, so it
-    avoids the classic macOS 'SSL: CERTIFICATE_VERIFY_FAILED' with plain
-    urllib) and falling back to the stdlib if requests isn't installed.
-    """
+def _http_get_once(url: str):
+    """One GET + JSON parse, preferring `requests` (certifi-backed SSL), else urllib."""
     try:
         import requests  # type: ignore
 
@@ -62,6 +59,26 @@ def _http_get_json(url: str):
             pass
         with urllib.request.urlopen(url, timeout=30, context=ctx) as resp:  # noqa: S310
             return json.loads(resp.read().decode())
+
+
+def _http_get_json(url: str, retries: int = 5, backoff: float = 2.0):
+    """GET a URL with retry + exponential backoff on transient network errors.
+
+    Deep-history runs make hundreds of calls; a single DNS blip or timeout must
+    not abandon a whole pair. ImportError (no `requests`) is NOT retried — it is
+    handled inside _http_get_once. Waits ~2, 4, 8, 16s between attempts.
+    """
+    import time as _time
+
+    last_exc = None
+    for attempt in range(retries):
+        try:
+            return _http_get_once(url)
+        except Exception as exc:  # noqa: BLE001 — transient network/HTTP errors: retry
+            last_exc = exc
+            if attempt < retries - 1:
+                _time.sleep(backoff * (2 ** attempt))
+    raise last_exc
 
 
 def fetch_binance_klines(symbol: str, interval: str, limit: int = 1000) -> pd.DataFrame:

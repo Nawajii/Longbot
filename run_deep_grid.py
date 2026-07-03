@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import time
 
 import numpy as np
 import pandas as pd
@@ -132,12 +133,23 @@ def run_deep(pairs, timeframe, start, end, capital, entry_valid_bars,
     proof_text, proof_sane = regime_bar_proof(regime_label)
     print("\n" + proof_text + "\n")
 
+    network_skipped = []
     for pair in pairs:
-        try:
-            df = fetch_or_cache(pair, timeframe, start, end, cache_dir, refresh)
-        except Exception as exc:  # noqa: BLE001
+        # per-pair retry pass on top of the per-request retries in the fetcher;
+        # cached (already-downloaded) pairs load instantly and never re-hit net.
+        df, err = None, None
+        for attempt in range(3):
+            try:
+                df = fetch_or_cache(pair, timeframe, start, end, cache_dir, refresh)
+                break
+            except Exception as exc:  # noqa: BLE001
+                err = exc
+                if attempt < 2:
+                    time.sleep(3 * (2 ** attempt))
+        if df is None:
             skipped += 1
-            print(f"[skip] {pair}: fetch failed ({exc})")
+            network_skipped.append(pair)
+            print(f"[skip] {pair}: fetch failed after retries ({err})")
             continue
         if len(df) < 300:
             skipped += 1
@@ -168,7 +180,8 @@ def run_deep(pairs, timeframe, start, end, capital, entry_valid_bars,
 
     return dict(trades=trades, by_regime=by_regime, worst_dd=worst_dd,
                 executed=executed, skipped=skipped, coverage=coverage,
-                bh_returns=bh_returns, proof_text=proof_text, proof_sane=proof_sane)
+                bh_returns=bh_returns, proof_text=proof_text, proof_sane=proof_sane,
+                network_skipped=network_skipped, requested=len(pairs))
 
 
 def _verdict(name, R):
@@ -250,7 +263,13 @@ def format_deep(R) -> str:
         elif status == "UNPROVEN":
             unproven.append(name)
     L += ["=" * 96]
-    if not R.get("proof_sane", True):
+    net_skipped = R.get("network_skipped", [])
+    if net_skipped:
+        L.append(f" VERDICT WITHHELD — INCOMPLETE SAMPLE: {len(net_skipped)} pair(s) failed to")
+        L.append(f" download ({', '.join(net_skipped)}). The >=200-trade bar cannot be judged on a")
+        L.append(" partial universe. Re-run (cached pairs load instantly; only the missing ones")
+        L.append(" re-fetch) until 'pairs run' equals the full requested set, THEN read the verdict.")
+    elif not R.get("proof_sane", True):
         L.append(" REGIME PROOF NOT SANE — the per-regime split is untrustworthy; verdict WITHHELD.")
     elif winners:
         best = max(winners, key=lambda x: x[1])
