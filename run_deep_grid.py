@@ -181,7 +181,8 @@ def run_deep(pairs, timeframe, start, end, capital, entry_valid_bars,
     return dict(trades=trades, by_regime=by_regime, worst_dd=worst_dd,
                 executed=executed, skipped=skipped, coverage=coverage,
                 bh_returns=bh_returns, proof_text=proof_text, proof_sane=proof_sane,
-                network_skipped=network_skipped, requested=len(pairs))
+                network_skipped=network_skipped, requested=len(pairs),
+                regime_label=regime_label)
 
 
 def _verdict(name, R):
