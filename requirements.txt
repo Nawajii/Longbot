@@ -1,0 +1,5 @@
+pandas>=2.0
+numpy>=1.24
+statsmodels>=0.14
+requests>=2.31
+pytest>=7.4

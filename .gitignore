@@ -1,0 +1,20 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+*.egg-info/
+
+# Fetched market data cache -- large, reproducible from data_fetch.py, and
+# must not be committed pre-populated since that would let a "run" ship
+# with silently stale or hand-edited prices.
+data_cache/*.csv
+
+# Backtest output -- this repo is pushed WITHOUT having been run (no
+# network access in the build environment). Do not commit fabricated or
+# stale results; results/report.md and results/trades.csv are generated
+# fresh by scripts/run_backtest.py.
+results/*.md
+results/*.csv
+
+.DS_Store
+.venv/
+venv/
