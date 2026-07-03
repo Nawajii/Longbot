@@ -108,6 +108,23 @@ and a **binding** verdict against a success bar fixed in advance (expectancy
 python run_exit_grid.py --timeframe 4h
 ```
 
+### Multi-scale equilibrium gate (final test of the trend line)
+`longbot/multiscale.py` + `run_multiscale.py` add a **24h (daily) trend + macro
+equilibrium gate** ANDed onto the 4h located entry: trade only when the daily is
+in an uptrend AND price is at/above the daily value-area support, AND the 4h
+shows the located pullback. Exits are the two prior leaders (TRAIL_6, TARGET_2R).
+
+> **Honest note:** this multi-scale gate is still, mechanically, a **filter** on
+> the existing entry engine. A filter can only *remove* trades — it cannot create
+> edge. The test is whether multi-scale *alignment* isolates a subset that
+> happens to carry genuine edge; the base-rate expectation is that it does not.
+> No-lookahead is enforced on **both** scales — the daily gate reads only
+> *completed* daily candles (shifted one day), proven by a unit test.
+
+```bash
+python run_multiscale.py            # deep walk-forward, binding verdict
+```
+
 The report **always** prints its assumptions (fees, slippage, risk %, stop
 distances) and compares your result against **buy-and-hold** and a
 **buy-the-peak** baseline. If the strategy can't beat buy-and-hold net of costs,

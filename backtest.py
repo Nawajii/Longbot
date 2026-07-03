@@ -202,6 +202,7 @@ def run_backtest(
     regime_df: pd.DataFrame | None = None,
     tag_series: pd.Series | None = None,
     location_features: pd.DataFrame | None = None,
+    entry_gate: pd.Series | None = None,
 ) -> BacktestResult:
     """Simulate the strategy over one pair's OHLCV history.
 
@@ -223,6 +224,12 @@ def run_backtest(
 
     # Precompute per-bar regime flag (no lookahead) if a regime series is given.
     regime_on = _regime_flags(df.index, regime_df) if regime_df is not None else None
+
+    # Optional extra AND-gate on entries (e.g. a higher-timeframe/multi-scale
+    # gate). Boolean, aligned to df.index; caller is responsible for no-lookahead.
+    extra_gate = None
+    if entry_gate is not None:
+        extra_gate = list(entry_gate.reindex(df.index).fillna(False).astype(bool).values)
 
     res = BacktestResult(params=params)
     capital = params.starting_capital
@@ -315,7 +322,8 @@ def run_backtest(
             v = verdicts[i]
             if v in entry_verdicts:
                 res.signals += 1
-                gated_out = regime_on is not None and not regime_on[i]
+                gated_out = (regime_on is not None and not regime_on[i]) or \
+                            (extra_gate is not None and not extra_gate[i])
                 if not gated_out:
                     row = feat.iloc[i]
                     ticket = ts.from_feature_row(

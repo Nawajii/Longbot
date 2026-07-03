@@ -98,7 +98,7 @@ def rung1(R):
     lines = ["#" * 96, " RUNG 1 — WALK-FORWARD OUT-OF-SAMPLE (folds: 2022, 2023, 2024, 2025+)", "#" * 96]
     per_variant = {}
 
-    for name in VARIANTS:
+    for name in R["trades"]:
         all_tr = R["trades"][name]
         folds = {f: [t for t in all_tr if _fold_of(t.entry_time) == f] for f in FOLDS}
         oos = [t for t in all_tr if _fold_of(t.entry_time) != "IS"]
@@ -174,12 +174,14 @@ def rung2(R, name):
     lines.append("   top 5 winners (R @ year): "
                  + ", ".join(f"{t.r_multiple:+.1f}@{t.entry_time.year}" for t in top5))
 
-    total_r = rs.sum()
-    top5_r = sum(t.r_multiple for t in top5)
-    top10_r = sum(t.r_multiple for t in top10)
-    if total_r > 0:
-        lines.append(f"   share of total R from top 5: {100*top5_r/total_r:.0f}%   "
-                     f"top 10: {100*top10_r/total_r:.0f}%")
+    # Concentration against GROSS profit (sum of winning R) — always bounded and
+    # interpretable, unlike a ratio to tiny/negative NET R.
+    gross_win = sum(r for r in rs if r > 0)
+    top5_win = sum(t.r_multiple for t in top5 if t.r_multiple > 0)
+    top10_win = sum(t.r_multiple for t in top10 if t.r_multiple > 0)
+    if gross_win > 0:
+        lines.append(f"   share of GROSS profit from top 5: {100*top5_win/gross_win:.0f}%   "
+                     f"top 10: {100*top10_win/gross_win:.0f}%")
 
     exp_ex5 = float(rs[:-REMOVE_TOP].mean()) if n > REMOVE_TOP else float("nan")
     lines.append(f"   expectancy: all {exp_all:+.3f} R  ->  removing top {REMOVE_TOP}: "

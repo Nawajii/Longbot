@@ -119,11 +119,16 @@ def _loc_features_cached(symbol: str, timeframe: str, df: pd.DataFrame,
 
 
 def run_deep(pairs, timeframe, start, end, capital, entry_valid_bars,
-             regime_symbol, cache_dir, refresh):
+             regime_symbol, cache_dir, refresh, variant_names=None, entry_gate_fn=None):
+    """Deep sweep. Optionally restrict to `variant_names` and AND an extra
+    per-pair entry gate `entry_gate_fn(df_4h) -> bool Series` (e.g. the
+    multi-scale daily gate). Caller guarantees the gate is no-lookahead.
+    """
     located_sp = se.ScoringParams(use_location=True)
-    trades = {v: [] for v in VARIANTS}
-    by_regime = {v: {r: [] for r in REGIMES} for v in VARIANTS}
-    worst_dd = {v: 0.0 for v in VARIANTS}
+    run_variants = {k: VARIANTS[k] for k in variant_names} if variant_names else dict(VARIANTS)
+    trades = {v: [] for v in run_variants}
+    by_regime = {v: {r: [] for r in REGIMES} for v in run_variants}
+    worst_dd = {v: 0.0 for v in run_variants}
     bh_returns, coverage = [], []
     executed = skipped = 0
 
@@ -164,13 +169,15 @@ def run_deep(pairs, timeframe, start, end, capital, entry_valid_bars,
 
         loc = _loc_features_cached(pair, timeframe, df, cache_dir, refresh)
         labels_on_pair = regime_label.reindex(df.index, method="ffill")
+        gate = entry_gate_fn(df) if entry_gate_fn is not None else None
 
         bh_returns.append(bt.buy_and_hold_return_pct(df, bt.BacktestParams()))
-        for name, over in VARIANTS.items():
+        for name, over in run_variants.items():
             p = bt.BacktestParams(starting_capital=capital, timeframe=timeframe,
                                   entry_valid_bars=entry_valid_bars, **over)
             res = bt.run_backtest(df, p, scoring_params=located_sp,
-                                  regime_df=regime_df, location_features=loc)
+                                  regime_df=regime_df, location_features=loc,
+                                  entry_gate=gate)
             trades[name] += res.trades
             for t in res.trades:
                 lab = labels_on_pair.get(t.entry_time, "CHOP")
