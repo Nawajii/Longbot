@@ -6,11 +6,14 @@ turn back up — never the falling knife, never the overheated peak. One positio
 at a time. No shorting, no futures, no margin, no leverage — ever (a deliberate,
 non-negotiable constraint).
 
-> **Status: Phase 1–2 foundation built; edge UNPROVEN.**
-> The brain, the order math, and an honest backtest exist and are tested. Whether
-> the strategy actually makes money is an open question that only a real-data
-> backtest can answer. **Do not risk real money** until that backtest shows an
-> edge over simply buying and holding, *after* fees and slippage.
+> **Status: RETIRED.** The pullback/trend-following engine below failed
+> walk-forward out-of-sample validation (see `run_validation.py`) — its
+> apparent edge did not survive being read forward through unseen years and
+> did not hold up in the 2022 bear: it was pure beta wearing a strategy's
+> clothes, not a real edge. It is kept in this repo for reference and because
+> the new strategy below reuses its proven backtest infrastructure. **Do not
+> trade the pullback/scoring_engine logic.** See "Leverage-flush mean
+> reversion" further down for the current, active strategy under test.
 
 ---
 
@@ -199,5 +202,120 @@ Python. The LLM lives only in the post-trade Coroner.
 ```bash
 python -m pytest -q
 ```
+
+---
+
+## Leverage-flush mean reversion (long-only) — the CURRENT strategy under test
+
+A new, separate strategy module (`longbot/funding.py`, `longbot/flush_engine.py`,
+`run_flush_validation.py`) that does **not** import or depend on
+`scoring_engine.py` / `trade_setter.py` — the retired pullback engine's brain.
+It reuses only this repo's proven *infrastructure*: `fetch_or_cache` (deep
+Binance kline fetch + CSV cache), `btc_regime_labels` (BULL/BEAR/CHOP macro
+regime), and the 0.10%/side fee + 0.05%/side slippage cost model.
+
+### The idea, and its data reality
+
+**Thesis:** in crypto perpetuals, a heavily long-leveraged crowd pays rising
+funding to hold. A downward nudge can trigger cascading forced liquidations —
+margin calls dump into thin liquidity and price *overshoots*. That selling is
+mechanical, not informational, so price tends to snap back once liquidations
+exhaust. We buy the flush, long-only spot, betting on the mechanical overshoot
+reverting. Unlike the retired pullback engine, this edge is supposed to be
+**direction-agnostic** — it trades overshoots, not trend — so it must not bleed
+in a bear market. That's the whole test.
+
+**Data reality (do not fight this):** Binance does not offer free historical
+liquidation data, and open interest history is capped at ~30 days. What *is*
+freely available with deep history is the **funding rate**
+(`/fapi/v1/fundingRate`, 8-hourly, back to ~2020 for most perps). So:
+- **Positioning/leverage signal = funding rate** (real, full history).
+- **Flush trigger = the price/volume footprint of a liquidation cascade**,
+  read off the spot klines we already fetch: a violent range + volume spike
+  with a long lower wick and a strong close (absorption) — the signature that
+  distinguishes a mechanical overshoot that gets bought back from a real,
+  information-driven crash that keeps falling.
+
+We never trade the perp itself, never short, never use leverage. Funding is
+used **only as a signal**; every position is a plain spot long. This keeps the
+halal, long-only constraint fully intact.
+
+### Fixed parameters (pre-registered — see `longbot/flush_engine.FlushParams`)
+
+| Condition | Rule |
+|---|---|
+| Spring loaded | funding's trailing 90-day percentile rank ≥ 0.85 (top 15%) |
+| Flush trigger | true range ≥ 2× trailing-20 avg **AND** volume ≥ 2× trailing-20 avg **AND** lower wick ≥ 1.5× body **AND** close in the upper third of the bar's range |
+| Entry | next bar's **open**, after both conditions are confirmed on a *closed* bar |
+| Target | +1.5×ATR (ATR frozen at the signal bar) **OR** funding ≤ its own trailing median |
+| Stop (mandatory) | −2.0×ATR (frozen at the signal bar) — the falling-knife protection |
+| Time stop | 30 bars |
+| Costs | 0.10%/side fee + 0.05%/side slippage, same as the retired engine |
+
+### No-lookahead, on two axes
+
+- **Price side:** the flush candle's wick/close-location is only fully known
+  at that candle's *close*, so entry is always the **next** bar's open — never
+  the signal bar itself. Trailing range/volume baselines use the 20 bars
+  *strictly before* the candle (`shift(1).rolling(20)`), so a bar can never
+  inflate its own baseline.
+- **Funding side:** a bar is aligned to the **last completed** funding print at
+  or before it (`longbot/funding.align_to_bars`, a backward `merge_asof` — a
+  bar can never see a print stamped after it). The percentile rank and
+  trailing median of a print use only that print and the ones before it.
+- Both are proven mechanically in `tests/test_no_lookahead.py`-style truncation
+  tests: `tests/test_funding_alignment.py` and the
+  `test_full_engine_truncation_invariance` test in `tests/test_flush_engine.py`
+  show that truncating (or replacing) the future never changes a past decision.
+
+### Universe
+
+The perp-listed subset of the existing 20-pair `DEFAULT_PAIRS` universe
+(`run_scenarios.DEFAULT_PAIRS`). Availability is checked **at run time**, not
+guessed offline: any symbol with no USDT-M perpetual (no funding history) is
+skipped and reported by name, as is any symbol with too little combined
+spot+funding history to warm up the 90-day percentile window.
+
+### Binding success bar (fixed before any result is seen)
+
+VALIDATED only if **all** of the following hold on the out-of-sample
+walk-forward run (folds: 2021, 2022, 2023, 2024, 2025+; strategy fixed, no
+per-fold refitting):
+
+- aggregate OOS expectancy ≥ **+0.15 R** net of costs
+- ≥ **100 OOS trades** aggregate (if flush signals are too rare to reach that
+  across the universe and years, the honest conclusion is "trades too rarely
+  to be viable," reported as such)
+- **2022 bear-fold expectancy ≥ 0** on a conclusive (≥30 trade) sample — a
+  thin sample is reported as *inconclusive*, not quietly treated as a pass
+- **not outlier-driven:** removing the top 5 trades leaves expectancy > **+0.05 R**
+- **not one-year-only:** the edge appears in ≥ 2 separate OOS folds
+
+Any single failure ⇒ **NOT VALIDATED**, reported plainly, no re-tuning against
+the OOS results.
+
+### The MAE/MFE diagnostic (descriptive only — does not feed back into the strategy)
+
+For every trade, `run_flush_validation.py` reports Maximum Adverse/Favorable
+Excursion in R, and specifically: how far stopped-out losers got toward target
+before reversing (is the stop too tight?), whether stopped-out trades tracked
+*past* the stop recovered or kept falling (the direct empirical read on
+whether the hard stop is cutting mechanical noise or real crashes), and how far
+winners ran past the fixed +1.5×ATR target (is it leaving R on the table?).
+This turns a pass/fail verdict into a diagnosis of *why*.
+
+### Reproduce
+
+```bash
+pip install -r requirements.txt
+python -m pytest tests/ -v                 # no network needed — synthetic + hand-built OHLCV/funding
+python run_flush_validation.py             # needs api.binance.com (spot) + fapi.binance.com (funding)
+```
+
+This was built and tested in a sandboxed environment with no outbound network
+access — it has **not** been run against real data. Do not trust any numbers
+that are not freshly generated by running it yourself. Reads the bar
+mechanically: if 2022 bleeds, or the edge only shows up in one fold, it is
+**NOT VALIDATED** regardless of how the aggregate number looks.
 Covers the indicators, the PEAK-vs-PULLBACK logic, the position sizing /
 min-notional rules, and the backtest's funnel/fee accounting.
