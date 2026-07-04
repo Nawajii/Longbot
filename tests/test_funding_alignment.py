@@ -125,3 +125,38 @@ def test_empty_funding_df_yields_all_nan():
     bar_index = pd.date_range("2021-01-01", periods=10, freq="4h")
     aligned = align_to_bars(empty, bar_index)
     assert aligned["funding_rate"].isna().all()
+
+
+def test_align_handles_mismatched_datetime_resolutions():
+    """Regression test: a real run hit merge_asof's "incompatible merge keys
+    dtype('<M8[us]') and dtype('<M8[ms]')" error because the funding index
+    (parsed from a fresh fetch, ms-resolution) and the bar index (parsed
+    from a CSV round-trip, us-resolution) ended up at different datetime64
+    resolutions despite representing the same instants. align_to_bars must
+    normalize both merge keys internally and merge cleanly regardless of
+    which resolution each side arrives in.
+    """
+    times = pd.date_range("2021-01-01", periods=5, freq="8h")
+    rates = [0.0001, 0.0002, 0.0003, 0.0004, 0.0005]
+
+    # funding index at millisecond resolution (mirrors fetch_funding_rate_range,
+    # which builds funding_time via pd.to_datetime(..., unit="ms"))
+    ms_index = pd.DatetimeIndex(times, name="funding_time").astype("datetime64[ms]")
+    funding_df = pd.DataFrame({"funding_rate": rates}, index=ms_index)
+    assert funding_df.index.dtype == np.dtype("datetime64[ms]")
+
+    # bar index at microsecond resolution (mirrors a CSV round-trip's string inference)
+    bar_index = pd.DatetimeIndex([
+        times[1],
+        times[2] - pd.Timedelta(minutes=1),
+        times[2] + pd.Timedelta(minutes=1),
+    ]).astype("datetime64[us]")
+    assert bar_index.dtype == np.dtype("datetime64[us]")
+
+    aligned = align_to_bars(funding_df, bar_index)  # must not raise MergeError
+
+    assert aligned["funding_rate"].iloc[0] == rates[1]
+    assert aligned["funding_rate"].iloc[1] == rates[1]
+    assert aligned["funding_rate"].iloc[2] == rates[2]
+    # the returned frame's index must still be the exact index the caller passed in
+    assert aligned.index.equals(bar_index)

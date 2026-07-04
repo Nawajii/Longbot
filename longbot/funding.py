@@ -120,11 +120,25 @@ def align_to_bars(funding_df: pd.DataFrame, bar_index: pd.DatetimeIndex) -> pd.D
     if funding_df.empty:
         return pd.DataFrame({c: np.nan for c in cols}, index=bar_index)
 
-    bars = pd.DataFrame({"bar_time": pd.DatetimeIndex(bar_index)}).sort_values("bar_time")
+    # merge_asof requires BOTH keys to share the exact same datetime64
+    # resolution. Bar timestamps and funding timestamps can end up at
+    # different resolutions depending on how each was parsed (a fresh
+    # fetch via `unit="ms"` vs. a CSV round-trip's string inference, for
+    # example), even though they represent the same instants -- so
+    # normalize both merge keys to a common resolution (ns) right before
+    # the merge. The function's return value is still reindexed against
+    # the caller's original `bar_index` untouched, so this is purely an
+    # internal merge-key normalization, not a change to what gets aligned.
+    common_res = "datetime64[ns]"
+    bars = pd.DataFrame({
+        "bar_time": pd.DatetimeIndex(bar_index).astype(common_res),
+    }).sort_values("bar_time")
     fr = funding_df.sort_index().reset_index()  # index is always named "funding_time" (see fetch_* above)
+    fr["funding_time"] = pd.DatetimeIndex(fr["funding_time"]).astype(common_res)
+
     merged = pd.merge_asof(bars, fr, left_on="bar_time", right_on="funding_time", direction="backward")
     merged = merged.set_index("bar_time")
-    return merged[cols].reindex(bar_index)
+    return merged[cols].reindex(pd.DatetimeIndex(bar_index).astype(common_res)).set_axis(bar_index)
 
 
 def funding_percentile_rank(funding_rate: pd.Series, window: int) -> pd.Series:
